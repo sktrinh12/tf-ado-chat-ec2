@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-HOME_PATH=/home/ec2-user
+USER=ec2-user
+HOME_PATH=/home/$USER
 
 echo "=== Starting setup at $(date) ==="
 
@@ -74,8 +75,8 @@ npm run build
 echo "Setting permissions..."
 sudo chmod 755 "$HOME_PATH"
 sudo chmod -R 755 "$HOME_PATH/frontend"
-sudo chown -R ec2-user:nginx "$HOME_PATH/frontend"
-sudo chown -R ec2-user:ec2-user "$HOME_PATH/app/chroma"
+sudo chown -R $USER:nginx "$HOME_PATH/frontend"
+sudo chown -R $USER:$USER "$HOME_PATH/app/chroma"
 sudo chmod -R 755 "$HOME_PATH/app/chroma"
 
 # FastAPI backend setup
@@ -97,7 +98,7 @@ Description=FastAPI app with Uvicorn
 After=network.target
 
 [Service]
-User=ec2-user
+User=$USER
 WorkingDirectory=$HOME_PATH/app
 Environment="HF_TOKEN=$HF_TOKEN"
 ExecStart=/usr/local/bin/python3 -m uvicorn llm_svc:app --host 0.0.0.0 --port 8000
@@ -116,10 +117,23 @@ sudo systemctl start fastapi
 if [ -n "$DUCKDNS_DOMAIN" ] && [ -n "$DUCKDNS_TOKEN" ] && [ -n "$LETSENCRYPT_EMAIL" ]; then
   echo "Setting up nginx with SSL via Let's Encrypt..."
 
+  CERTS_DIR="$HOME_PATH/ssl-certs"
+  mkdir -p $CERTS_DIR
+  chown -R $USER:$USER $CERTS_DIR
+
   sudo tee /etc/nginx/conf.d/ado_app.conf > /dev/null <<EOF
 server {
     listen 80;
     server_name $DUCKDNS_DOMAIN;
+    return 301 https://$host$request_uri;  # redirect all HTTP to HTTPS
+}
+
+server {
+    listen 443 ssl;
+    server_name $DUCKDNS_DOMAIN;
+
+    ssl_certificate $CERTS_DIR/fullchain.pem;
+    ssl_certificate_key $CERTS_DIR/privkey.pem;
     
     root $HOME_PATH/frontend/dist;
     index index.html;
@@ -128,7 +142,7 @@ server {
         try_files \$uri \$uri/ /index.html;
     }
     
-    location /api {
+    location /api/ {
         proxy_pass http://localhost:8000/;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -138,9 +152,22 @@ server {
 }
 EOF
 
-  sudo systemctl restart nginx
   sudo yum install -y certbot python3-certbot-nginx
-  sudo certbot --nginx -d "$DUCKDNS_DOMAIN" --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" --redirect
+
+  echo "Checking S3 for existing certs..."
+  aws s3 ls s3://preludetx-strinh/ado-chat-certs/ > /dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    echo "Downloading existing certs from S3..."
+    aws s3 cp s3://preludetx-strinh/ado-chat-certs/fullchain.pem $CERTS_DIR/fullchain.pem
+    aws s3 cp s3://preludetx-strinh/ado-chat-certs/privkey.pem   $CERTS_DIR/privkey.pem
+    aws s3 cp s3://preludetx-strinh/ado-chat-certs/chain.pem     $CERTS_DIR/chain.pem
+    aws s3 cp s3://preludetx-strinh/ado-chat-certs/cert.pem      $CERTS_DIR/cert.pem
+  else
+    echo "No certs found in S3, running Certbot..."
+    sudo yum install -y certbot python3-certbot-nginx
+    sudo certbot --nginx -d $DUCKDNS_DOMAIN --non-interactive --agree-tos -m $LETSENCRYPT_EMAIL --redirect
+  fi
+
   sudo dnf install -y cronie
   sudo systemctl enable crond
   sudo systemctl start crond
@@ -164,8 +191,9 @@ server {
     }
 }
 EOF
-  sudo systemctl restart nginx
 fi
+
+sudo systemctl restart nginx
 
 if [ -n "$DUCKDNS_DOMAIN" ] && [ -n "$DUCKDNS_TOKEN" ]; then
   echo "Setting up DuckDNS auto-update cron job..."
